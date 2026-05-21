@@ -1,0 +1,79 @@
+Project Architecture Overview
+=============================
+
+This repository implements an **autonomous AI software‑engineering team** built with **LangGraph** and exposed via a **FastAPI** HTTP API.  Below is a high‑level map of the top‑level directories and the most important files within each.
+
+---
+
+1. **src/** – Core source code
+   - **app.py** – Entry‑point for the FastAPI server. Sets up logging, CORS, mounts the API router (`/api/v1`) and defines a root redirect to the docs UI.
+   - **api/** – HTTP route definitions.
+     - `routes.py` – Declares the FastAPI `APIRouter` with endpoints used to start a new project, trigger the graph execution, query status, etc.
+   - **core/** – Building blocks for the LangGraph pipeline.
+     - `graph.py` – Constructs the `StateGraph` describing the whole agent workflow: initialisation → requirement analysis → architecture → task planning → workers (backend/frontend) → QA/testing → review → watchdog → human approval.
+     - `state.py` – Defines `ProjectState`, a Pydantic model (or dict‑like) that holds the mutable workflow state (project id, workspace path, task queue, trace, retry counts, etc.).
+     - `middleware.py` – Provides `retry_middleware` that wraps each agent node so failures are logged and automatically retried.
+     - `config.py` – Central configuration (defaults, environment overrides) used throughout the system.
+   - **agents/** – Individual LangGraph *nodes* (each is a callable that receives `ProjectState` and returns a dict of updates).
+     - `architect.py` – Designs a high‑level system architecture from requirements.
+     - `backend_engineer.py` – Generates backend code files.
+     - `frontend_engineer.py` – Generates frontend code files.
+     - `requirement_analyzer.py` – Parses the original natural‑language request into concrete requirements.
+     - `task_planner.py` – Turns requirements into a queue of concrete file‑level tasks.
+     - `tester.py` – Runs automated tests on generated code.
+     - `reviewer.py` – Performs a security / style review of the code.
+     - `watchdog.py` – Monitors retry counts, detects infinite loops, and can hand‑off to a human for approval.
+     - `memory.py` – (currently `memory_compression_node`) – optional step to compact execution trace.
+     - `memory.py` – `memory_compression_node` – placeholder for future memory‑management logic.
+     - `watchdog.py` also defines `human_approval_node` – a stub node awaiting manual intervention.
+   - **tools/** – Helper utilities that agents call.
+     - `filesystem.py` – `FileSystemManager` handles creating files/folders inside a sandboxed workspace and records each action in the trace.
+     - `git_tracker.py` – `GitTracker` wraps git commands (init, commit, branch handling) to version‑control the generated project.
+     - `executor.py` – General purpose command executor used by agents that need to run build / test commands.
+   - **__init__.py** – Makes `src` a package; often re‑exports helpful symbols.
+
+2. **tests/** – Integration / unit tests for the API and graph.
+   - `test_tools_integration.py` – Checks that the tool layer works end‑to‑end.
+   - Additional test files (not listed) exercise the FastAPI routes and graph execution.
+
+3. **docker-compose.yml** – (If you prefer Docker) defines a service that runs the FastAPI app with the necessary environment.
+
+4. **pyproject.toml** – Poetry / PDM style project metadata, lists dependencies such as `fastapi`, `langgraph`, `uvicorn`, etc.
+
+5. **.env.example** – Sample environment file showing configurable parameters (e.g., API keys for LLM providers).
+
+---
+
+### Execution Flow (What to start first?)
+1. **Start the API** – Run `uvicorn src.app:app --reload` (or `docker compose up`). This launches the FastAPI server.
+2. **Create a project** – POST to `/api/v1/projects` (see `routes.py`) with a natural‑language requirement.
+3. **Graph compilation** – `src.core.graph.build_graph()` builds the LangGraph pipeline; this happens at startup (see `app.lifespan`).
+4. **Initialisation node** – Creates a temporary workspace, a git repo, and seeds the execution trace.
+5. **Planning phase** – Requirement analyser → Architect → Task planner. The planner populates `state["task_queue"]` with tasks like “create file X.py”.
+6. **Worker routing** – `route_to_workers` decides, based on file extension, whether the **frontend_engineer** or **backend_engineer** node should handle each task.
+7. **QA / Review** – After all workers finish, the `memory_compression` (optional), `tester`, and `reviewer` nodes evaluate the generated code.
+8. **Watchdog / Human approval** – If any node fails repeatedly, the watchdog routes to `human_approval_node` for manual fix.
+9. **Completion** – When the graph reaches `END` the final state (including a git history of the generated project) is returned to the caller.
+
+---
+
+### How to Navigate the Code as a Beginner
+- **Start with `app.py`** – Understand how the FastAPI server is configured and where the router is mounted.
+- **Read `api/routes.py`** – See the HTTP endpoints and how they invoke the graph (`build_graph().invoke(initial_state)`).
+- **Inspect `core/graph.py`** – This file defines the overall workflow; follow the `add_node` and `add_edge` calls to understand the sequence.
+- **Look at one agent file (e.g., `agents/frontend_engineer.py`)** – Each node follows the same signature: `def node(state: ProjectState) -> dict[str, Any]`. The node reads the next task from `state["task_queue"]`, generates code using the LLM, writes files via `FileSystemManager`, and updates the state.
+- **Explore `tools/`** – The helpers abstract away filesystem and git operations, making the agents simpler.
+- **Run the tests** – `pytest -q` will execute `tests/` and give you concrete examples of how the API and graph are expected to behave.
+
+---
+
+### Quick Start Checklist
+1. `python -m venv .venv && .\.venv\Scripts\activate`
+2. `pip install -r requirements.txt` (or `poetry install` if using Poetry).
+3. `uvicorn src.app:app --reload`
+4. Open a browser at `http://127.0.0.1:8000/docs` and try the "Create Project" endpoint.
+5. Watch the logs – each node logs a `[NODE]` message; if something fails you’ll see the retry middleware output.
+
+---
+
+**End of Overview**
