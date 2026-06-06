@@ -15,9 +15,11 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from src.core.graph import build_graph
+from src.core.observability import get_run_config
 
 logger = logging.getLogger(__name__)
 
@@ -140,7 +142,14 @@ def run_project(body: RunRequest) -> RunResponse:
     }
 
     try:
-        final_state = _compiled_graph.invoke(initial_state)
+        # Build LangSmith run config so this entire pipeline execution
+        # shows up as a single named trace in the LangSmith UI.
+        run_config = get_run_config(
+            project_id=project_id,
+            node_name="pipeline",
+            requirements_length=len(body.requirements),
+        )
+        final_state = _compiled_graph.invoke(initial_state, config=run_config)
     except Exception as exc:
         logger.exception("Pipeline invocation failed for %s", project_id)
         raise HTTPException(status_code=500, detail=str(exc)) from exc

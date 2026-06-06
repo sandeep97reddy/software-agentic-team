@@ -18,6 +18,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from src.api.routes import router as project_router
+from src.core.observability import setup_langsmith
 
 # ──────────────────────────────────────────────────────────────
 #  Logging configuration
@@ -41,11 +42,16 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     """Application lifespan — runs on startup and shutdown."""
+    # ── LangSmith observability (must be first) ──────────────
+    tracing_on = setup_langsmith()
+    tracing_status = "ENABLED" if tracing_on else "DISABLED"
+
     logger.info("=" * 60)
     logger.info("  [BOT] AI Software Engineering Team -- starting up")
     logger.info("=" * 60)
-    logger.info("  Graph compiled [OK]")
-    logger.info("  API routes registered [OK]")
+    logger.info("  Graph compiled               [OK]")
+    logger.info("  API routes registered        [OK]")
+    logger.info("  LangSmith tracing            [%s]", tracing_status)
     logger.info("  Ready to accept requests")
     logger.info("=" * 60)
     yield

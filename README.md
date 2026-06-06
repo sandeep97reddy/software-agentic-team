@@ -15,13 +15,14 @@ This project implements a sophisticated orchestration pipeline where specialised
   - *QA Tester:* Auto-generates `pytest` test suites and runs them against new code.
   - *Code Reviewer:* Scans for security vulnerabilities (e.g., SQLi, XSS) and hallucinated dependencies.
 - **Secure Tool Layer:** 
-  - `FileSystemManager`: Sandboxed read/write capabilities preventing directory traversal.
-  - `GitTracker`: Automatically tracks mutations via local git branches and commits.
-  - `SubprocessExecutor`: Runs external tools (like `pytest`) safely with strict timeouts and allowlists.
+  - [FileSystemManager](file:///c:/Users/SANDEEP/Desktop/projects/software%20agentic%20team/src/tools/filesystem.py): Sandboxed read/write capabilities preventing directory traversal.
+  - [GitTracker](file:///c:/Users/SANDEEP/Desktop/projects/software%20agentic%20team/src/tools/git_tracker.py): Automatically tracks mutations via local git branches and commits.
+  - [SubprocessExecutor](file:///c:/Users/SANDEEP/Desktop/projects/software%20agentic%20team/src/tools/executor.py): Runs external tools (like `pytest`) safely with strict timeouts and allowlists.
 - **Anti-Loop Watchdog:** If an agent fails a task (e.g., failing tests or code review) 3 times, the system breaks the infinite loop and redirects to a `Human Approval` node.
 - **Memory Compression:** To avoid exceeding LLM context windows on long runs, the system automatically summarizes completed tasks and clears raw execution traces while preserving the core architectural context.
+- **LangSmith Observability:** Full distributed tracing of every LLM call, LangGraph node transition, and tool invocation via LangSmith — zero code changes required once `LANGSMITH_API_KEY` is set.
 - **FastAPI Endpoints:** Trigger pipeline executions and monitor live task state via standard REST endpoints (`/execute` and `/status`).
-- **State Persistence:** Included `docker-compose.yml` provides PostgreSQL (for LangGraph state check-pointing) and Redis (for task queues).
+- **State Persistence:** Included [docker-compose.yml](file:///c:/Users/SANDEEP/Desktop/projects/software%20agentic%20team/docker-compose.yml) provides PostgreSQL (for LangGraph state check-pointing) and Redis (for task queues).
 
 ---
 
@@ -50,6 +51,70 @@ Before building any AI system, it's crucial to understand when and when not to u
 
 ---
 
+## 🔭 LangSmith Observability
+
+Every LLM call, LangGraph node transition, and tool invocation is automatically traced in [LangSmith](https://smith.langchain.com). This gives you:
+
+- A **full trace tree** of every agent run — see exactly which node called which model with what inputs and outputs.
+- **Latency & cost tracking** per node and per pipeline run.
+- **Prompt comparisons** across runs to spot regressions.
+- **Searchable run history** filterable by `project_id`, `node_name`, and custom tags.
+
+### Setup
+
+1. **Create a free account** at [https://smith.langchain.com](https://smith.langchain.com).
+2. Go to **Settings → API Keys** and create a new key.
+3. Copy `.env.example` to `.env` and fill in your key:
+
+```bash
+cp .env.example .env
+```
+
+```dotenv
+LANGSMITH_API_KEY=lsv2_your-key-here
+LANGSMITH_PROJECT=ai-software-team   # groups all runs in the UI
+```
+
+4. Start the server — tracing is **automatically enabled** when the key is present:
+
+```bash
+uvicorn src.app:app --reload --port 8000
+# Startup log will print:  LangSmith tracing  [ENABLED]
+```
+
+### What Gets Traced
+
+| Signal | How |
+|---|---|
+| Every LLM call (all agents) | Auto-traced by `langchain-core` via env vars |
+| Full pipeline run | Tagged with `project_id`, `run_name`, and `node:*` tags |
+| Latency per node | Captured automatically by LangGraph's LangSmith integration |
+| Custom metadata | `requirements_length`, `node_name` attached to every top-level run |
+
+### Developer Guide: Customizing Traces
+
+The observability implementation resides in [observability.py](file:///c:/Users/SANDEEP/Desktop/projects/software%20agentic%20team/src/core/observability.py):
+- **Initialization:** During FastAPI startup (in `src/app.py`), `setup_langsmith()` is invoked. If `LANGSMITH_API_KEY` is present, it dynamically sets LangChain environment variables globally so that all subsequent LLM and LangGraph invocations are automatically intercepted and recorded.
+- **Run Configuration & Tags:** When a run is executed in [routes.py](file:///c:/Users/SANDEEP/Desktop/projects/software%20agentic%20team/src/api/routes.py), a custom run configuration is created using the `get_run_config()` helper:
+  ```python
+  run_config = get_run_config(
+      project_id=project_id,
+      node_name="pipeline",
+      requirements_length=len(body.requirements),
+  )
+  final_state = _compiled_graph.invoke(initial_state, config=run_config)
+  ```
+- **Metadata and UI Grouping:** This config attaches:
+  - Custom tags like `project:<short_id>` and `node:pipeline`.
+  - Metadata attributes such as `project_id`, `node_name`, and any additional key-value pairs (`requirements_length`, etc.).
+  - A descriptive `run_name` to group children runs neatly in the LangSmith dashboard.
+
+### Disabling Tracing
+
+Set `LANGCHAIN_TRACING_V2=false` (or simply leave `LANGSMITH_API_KEY` unset). The startup log will confirm `LangSmith tracing [DISABLED]` and no data is sent.
+
+---
+
 ## Installation
 
 1. **Clone the repository**
@@ -61,45 +126,52 @@ Before building any AI system, it's crucial to understand when and when not to u
 2. **Set up the virtual environment**
    ```bash
    python -m venv .venv
-   source .venv/bin/activate  # On Windows use: .venv\Scripts\activate
+   # Windows:
+   .venv\Scripts\activate
+   # macOS / Linux:
+   source .venv/bin/activate
    ```
 
 3. **Install Dependencies**
-   If you have Poetry installed:
    ```bash
+   pip install -e .
+   # or if you use Poetry:
    poetry install
    ```
-   Or via pip (if `requirements.txt` is exported):
-   ```bash
-   pip install -r requirements.txt
-   ```
 
-4. **Environment Variables**
-   Set up your LLM credentials (e.g., OpenAI API Key, Anthropic API Key) required by the `src.core.config.get_llm()` method.
+4. **Configure Environment Variables**
    ```bash
-   export OPENAI_API_KEY="sk-..."
-   # or
-   export ANTHROPIC_API_KEY="..."
+   cp .env.example .env
+   # Edit .env — at minimum set OPENAI_API_KEY and LANGSMITH_API_KEY
    ```
+   See [.env.example](file:///c:/Users/SANDEEP/Desktop/projects/software%20agentic%20team/.env.example) for all available options.
 
 5. **Start Infrastructure (PostgreSQL & Redis)**
    ```bash
    docker-compose up -d
    ```
+   Uses the provided [docker-compose.yml](file:///c:/Users/SANDEEP/Desktop/projects/software%20agentic%20team/docker-compose.yml).
 
 ## Usage
 
-Start the FastAPI orchestration server:
+Start the FastAPI orchestration server defined in [app.py](file:///c:/Users/SANDEEP/Desktop/projects/software%20agentic%20team/src/app.py):
 ```bash
-uvicorn src.api.routes:router --host 0.0.0.0 --port 8000 --reload
+uvicorn src.app:app --host 0.0.0.0 --port 8000 --reload
 ```
-*(Note: Wrap the router in a FastAPI app instance in a new `app.py` or modify the command as per your exact setup).*
 
 ### Endpoints
 
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/api/v1/execute` | Trigger a new full pipeline run |
+| `GET` | `/api/v1/status?project_id=...` | Poll the current state of a run |
+| `POST` | `/api/v1/projects/run` | Alias for `/execute` |
+| `GET` | `/api/v1/health` | Liveness probe — returns node list |
+| `GET` | `/docs` | Interactive Swagger UI |
+
 **Kick off a new project:**
 ```bash
-curl -X POST http://localhost:8000/execute \
+curl -X POST http://localhost:8000/api/v1/execute \
   -H "Content-Type: application/json" \
   -d '{
     "requirements": "Build a simple to-do application with a FastAPI backend and React frontend.",
@@ -109,17 +181,20 @@ curl -X POST http://localhost:8000/execute \
 
 **Check Project Status:**
 ```bash
-curl http://localhost:8000/status?project_id=<UUID_RETURNED_FROM_EXECUTE>
+curl "http://localhost:8000/api/v1/status?project_id=<UUID_RETURNED_FROM_EXECUTE>"
 ```
 
 ## How It Works Under the Hood
 
 1. **Initialization:** The system creates a temporary sandboxed workspace and initializes a local `git` repository.
-2. **Planning Phase:** The `Requirement Analyzer` passes context to the `Architect`, which passes structural context to the `Task Planner`. A Queue is built.
+2. **Planning Phase:** The [Requirement Analyzer](file:///c:/Users/SANDEEP/Desktop/projects/software%20agentic%20team/src/agents/requirement_analyzer.py) parses user requirements, passing structured specifications to the [Architect](file:///c:/Users/SANDEEP/Desktop/projects/software%20agentic%20team/src/agents/architect.py) (who designs directories and schemas), which then feeds into the [Task Planner](file:///c:/Users/SANDEEP/Desktop/projects/software%20agentic%20team/src/agents/task_planner.py) to build an atomic task queue.
 3. **Execution Loop:** 
-   - A router pops tasks from the queue and sends them to either the `Backend` or `Frontend` engineer.
-   - The engineers write the code and commit it to the local git repo.
-4. **Validation Phase:** 
-   - The `QA Tester` auto-generates unit tests and runs them in the sandbox. If tests fail, it re-queues the task with feedback.
-   - The `Reviewer` scans the code for security holes.
-5. **Memory Management:** If the queue is successfully processed, but the state becomes too large, the `Memory Compression Node` summarizes the log history to save tokens before the next iteration.
+   - A router pops tasks from the queue and routes them to either the [Backend Engineer](file:///c:/Users/SANDEEP/Desktop/projects/software%20agentic%20team/src/agents/backend_engineer.py) or the [Frontend Engineer](file:///c:/Users/SANDEEP/Desktop/projects/software%20agentic%20team/src/agents/frontend_engineer.py).
+   - Engineers write the code, commit it using the git tool, and update the state.
+   - A Stagnation Check prevents stuck execution by failing if the code output remains unchanged for two consecutive attempts.
+4. **Memory Compression:** As the graph history grows, the [Memory Compression Node](file:///c:/Users/SANDEEP/Desktop/projects/software%20agentic%20team/src/agents/memory.py) condenses completed tasks and logs to keep the LLM context usage minimal.
+5. **Validation Phase:** 
+   - The [QA Tester](file:///c:/Users/SANDEEP/Desktop/projects/software%20agentic%20team/src/agents/tester.py) generates `pytest` files and executes them.
+   - The [Code Reviewer](file:///c:/Users/SANDEEP/Desktop/projects/software%20agentic%20team/src/agents/reviewer.py) scans code artifacts for bugs, security issues, and import anomalies.
+   - The [Watchdog](file:///c:/Users/SANDEEP/Desktop/projects/software%20agentic%20team/src/agents/watchdog.py) tracks retry counts. If a task fails three times, it routes control to a human approval node to stop the loop.
+

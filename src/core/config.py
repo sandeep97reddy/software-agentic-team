@@ -10,6 +10,13 @@ OPENAI_API_KEY          Required.  The OpenAI (or compatible) API key.
 MODEL_NAME              Optional.  Defaults to ``gpt-4o``.
 TEMPERATURE             Optional.  Defaults to ``0.2`` (deterministic-leaning).
 MAX_TOKENS              Optional.  Defaults to ``4096``.
+
+LangSmith (observability)
+--------------------------
+LANGSMITH_API_KEY       Required to enable tracing.
+LANGSMITH_PROJECT       Optional.  Defaults to ``ai-software-team``.
+LANGSMITH_ENDPOINT      Optional.  Defaults to https://api.smith.langchain.com.
+LANGCHAIN_TRACING_V2    Optional.  Defaults to ``true`` when key is present.
 """
 
 from __future__ import annotations
@@ -38,6 +45,11 @@ def get_llm(
     """
     Return a configured ``ChatOpenAI`` instance.
 
+    LangSmith tracing is applied automatically when the
+    ``LANGSMITH_API_KEY`` environment variable is set.  Every call made
+    through the returned LLM will appear as a child span under the active
+    LangSmith run.
+
     Parameters
     ----------
     model : str
@@ -50,7 +62,7 @@ def get_llm(
     Returns
     -------
     ChatOpenAI
-        Ready-to-use LangChain chat model.
+        Ready-to-use LangChain chat model with tracing wired in.
 
     Raises
     ------
@@ -75,4 +87,6 @@ def get_llm(
         temperature=temperature,
         max_tokens=max_tokens,
         api_key=api_key,
+        # LangSmith tracing is injected globally via env vars set in
+        # observability.setup_langsmith(); no extra args needed here.
     )
