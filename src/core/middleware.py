@@ -92,8 +92,8 @@ def retry_middleware(
         @functools.wraps(func)
         def wrapper(state: ProjectState) -> dict[str, Any]:
             # Initialise retry bookkeeping if absent
-            retry_counts: dict[str, int] = dict(state.get("retry_counts", {}))
-            current_count: int = retry_counts.get(node_name, 0)
+            retry_counts = state.get("retry_counts", {})
+            current_count: int = retry_counts.get(node_name, 0) if isinstance(retry_counts, dict) else 0
             max_allowed: int = state.get("max_retries", max_retries)
 
             for attempt in range(1, max_allowed + 2):  # 1-indexed, includes initial try
@@ -104,17 +104,19 @@ def retry_middleware(
                         attempt,
                         max_allowed + 1,
                     )
-                    result: dict[str, Any] = func(state)
+                    result: dict[str, Any] = func(state) or {}
 
-                    # Success — reset the failure counter for this node
-                    retry_counts[node_name] = 0
-                    result["retry_counts"] = retry_counts
+                    # Success — reset the failure counter for this node while preserving other keys
+                    existing_counts = result.get("retry_counts", {})
+                    if isinstance(existing_counts, dict):
+                        result["retry_counts"] = {**existing_counts, node_name: 0}
+                    else:
+                        result["retry_counts"] = {node_name: 0}
                     logger.info("[OK] [%s] succeeded on attempt %d", node_name, attempt)
                     return result
 
                 except Exception as exc:
                     current_count += 1
-                    retry_counts[node_name] = current_count
                     error_record = _build_error_record(node_name, exc, attempt)
 
                     logger.warning(
@@ -133,7 +135,7 @@ def retry_middleware(
                             max_allowed,
                         )
                         return {
-                            "retry_counts": retry_counts,
+                            "retry_counts": {node_name: current_count},
                             "error_log": [error_record],
                             "status": "failed",
                         }
@@ -145,9 +147,9 @@ def retry_middleware(
 
             # Defensive — should never reach here
             return {
-                "retry_counts": retry_counts,
+                "retry_counts": {node_name: current_count},
                 "status": "failed",
-            }  # pragma: no cover
+            }
 
         return wrapper
 
@@ -173,8 +175,8 @@ def async_retry_middleware(
 
         @functools.wraps(func)
         async def wrapper(state: ProjectState) -> dict[str, Any]:
-            retry_counts: dict[str, int] = dict(state.get("retry_counts", {}))
-            current_count: int = retry_counts.get(node_name, 0)
+            retry_counts = state.get("retry_counts", {})
+            current_count: int = retry_counts.get(node_name, 0) if isinstance(retry_counts, dict) else 0
             max_allowed: int = state.get("max_retries", max_retries)
 
             for attempt in range(1, max_allowed + 2):
@@ -185,16 +187,18 @@ def async_retry_middleware(
                         attempt,
                         max_allowed + 1,
                     )
-                    result: dict[str, Any] = await func(state)
+                    result: dict[str, Any] = (await func(state)) or {}
 
-                    retry_counts[node_name] = 0
-                    result["retry_counts"] = retry_counts
+                    existing_counts = result.get("retry_counts", {})
+                    if isinstance(existing_counts, dict):
+                        result["retry_counts"] = {**existing_counts, node_name: 0}
+                    else:
+                        result["retry_counts"] = {node_name: 0}
                     logger.info("[OK] [%s] succeeded on attempt %d", node_name, attempt)
                     return result
 
                 except Exception as exc:
                     current_count += 1
-                    retry_counts[node_name] = current_count
                     error_record = _build_error_record(node_name, exc, attempt)
 
                     logger.warning(
@@ -212,7 +216,7 @@ def async_retry_middleware(
                             max_allowed,
                         )
                         return {
-                            "retry_counts": retry_counts,
+                            "retry_counts": {node_name: current_count},
                             "error_log": [error_record],
                             "status": "failed",
                         }
@@ -222,9 +226,9 @@ def async_retry_middleware(
                     await asyncio.sleep(delay)
 
             return {
-                "retry_counts": retry_counts,
+                "retry_counts": {node_name: current_count},
                 "status": "failed",
-            }  # pragma: no cover
+            }
 
         return wrapper
 
