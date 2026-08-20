@@ -38,21 +38,22 @@ Return approved=True if clean, otherwise approved=False with specific actionable
 @retry_middleware(max_retries=3)
 def reviewer_node(state: ProjectState) -> dict[str, Any]:
     artifacts = state.get("code_artifacts", [])
-    task_queue = list(state.get("task_queue", []))
+    task_queue = state.get("task_queue", [])
     retry_counts = dict(state.get("retry_counts", {}))
-
-    llm = get_llm(temperature=0.1, max_tokens=2048)
-    structured_llm = llm.with_structured_output(ReviewResult)
+    task_failures = dict(state.get("task_failures", {}))
 
     review_failed = False
+    new_tasks: list[dict[str, Any]] = []
 
     for artifact in artifacts:
         file_path = artifact.get("file_path", "")
-        # Only review if it's actual source code, maybe skip tests
+        # Only review if it's actual source code, skip tests
         if "test_" in file_path:
             continue
 
         logger.info(f"[REVIEW] Scanning {file_path} for security flaws...")
+        llm = get_llm(temperature=0.1, max_tokens=2048)
+        structured_llm = llm.with_structured_output(ReviewResult)
         result: ReviewResult = structured_llm.invoke(
             [
                 {"role": "system", "content": SYSTEM_PROMPT},
@@ -69,6 +70,7 @@ def reviewer_node(state: ProjectState) -> dict[str, Any]:
 
             task_key = f"task_fail_{file_path}"
             retry_counts[task_key] = retry_counts.get(task_key, 0) + 1
+            task_failures[file_path] = task_failures.get(file_path, 0) + 1
 
             filename = file_path.split("/")[-1]
             fix_task = {
@@ -82,15 +84,19 @@ def reviewer_node(state: ProjectState) -> dict[str, Any]:
                     else "frontend_engineer"
                 ),
                 "status": "pending",
-                "metadata": {"task_key": task_key},
+                "metadata": {"task_key": file_path},
             }
-            if not any(t.get("file_path") == file_path for t in task_queue):
-                task_queue.append(fix_task)
+            if not any(
+                t.get("file_path") == file_path and t.get("status") == "pending"
+                for t in task_queue
+            ):
+                new_tasks.append(fix_task)
 
     if review_failed:
         return {
-            "task_queue": task_queue,
+            "task_queue": new_tasks,
             "retry_counts": retry_counts,
+            "task_failures": task_failures,
             "current_phase": "review",
         }
 

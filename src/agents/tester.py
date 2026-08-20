@@ -26,6 +26,10 @@ class TestCode(BaseModel):
     test_code: str = Field(description="Full pytest source code")
 
 
+# Tell pytest not to discover TestCode as a test suite
+TestCode.__test__ = False  # type: ignore[attr-defined]
+
+
 SYSTEM_PROMPT = """\
 You are an expert QA Tester.
 Given the source code of a newly implemented Python file, write comprehensive pytest test cases for it.
@@ -37,18 +41,18 @@ Return the complete test file code. Do not use placeholders.
 @retry_middleware(max_retries=3)
 def tester_node(state: ProjectState) -> dict[str, Any]:
     artifacts = state.get("code_artifacts", [])
-    task_queue = list(state.get("task_queue", []))
+    task_queue = state.get("task_queue", [])
     retry_counts = dict(state.get("retry_counts", {}))
+    task_failures = dict(state.get("task_failures", {}))
     workspace_dir = state.get("workspace_dir", "")
     trace: list[dict[str, Any]] = []
 
     exe = SubprocessExecutor(workspace_dir, trace)
     fs = FileSystemManager(workspace_dir, trace)
 
-    llm = get_llm(temperature=0.2, max_tokens=8192)
-    structured_llm = llm.with_structured_output(TestCode)
-
     tests_failed = False
+    new_tasks: list[dict[str, Any]] = []
+    updated_artifacts: list[dict[str, Any]] = []
 
     # We test any python artifact that doesn't have a test file yet
     for artifact in artifacts:
@@ -66,6 +70,8 @@ def tester_node(state: ProjectState) -> dict[str, Any]:
         # If test doesn't exist, generate it
         if not fs.file_exists(test_file_path):
             logger.info(f"[QA] Generating tests for {file_path}")
+            llm = get_llm(temperature=0.2, max_tokens=8192)
+            structured_llm = llm.with_structured_output(TestCode)
             result: TestCode = structured_llm.invoke(
                 [
                     {"role": "system", "content": SYSTEM_PROMPT},
@@ -86,9 +92,10 @@ def tester_node(state: ProjectState) -> dict[str, Any]:
             logger.warning(f"[QA] Test failed for {file_path}")
             tests_failed = True
 
-            # Track failure for Watchdog node
+            # Track failure count for Watchdog and retry bookkeeping
             task_key = f"task_fail_{file_path}"
             retry_counts[task_key] = retry_counts.get(task_key, 0) + 1
+            task_failures[file_path] = task_failures.get(file_path, 0) + 1
 
             # Put task back in queue to be fixed
             fix_task = {
@@ -98,18 +105,35 @@ def tester_node(state: ProjectState) -> dict[str, Any]:
                 "file_path": file_path,
                 "assigned_to": "backend_engineer",
                 "status": "pending",
-                "metadata": {"task_key": task_key},
+                "metadata": {"task_key": file_path},
             }
             # Only add if not already in queue
-            if not any(t.get("file_path") == file_path for t in task_queue):
-                task_queue.append(fix_task)
+            if not any(
+                t.get("file_path") == file_path and t.get("status") == "pending"
+                for t in task_queue
+            ):
+                new_tasks.append(fix_task)
+
+            updated_artifacts.append(
+                {"file_path": file_path, "tests_passed": False}
+            )
+        else:
+            updated_artifacts.append(
+                {"file_path": file_path, "tests_passed": True}
+            )
 
     if not tests_failed:
         logger.info("[QA] All tests passed!")
 
     return {
-        "task_queue": task_queue,
+        "task_queue": new_tasks,
         "retry_counts": retry_counts,
+        "task_failures": task_failures,
+        "code_artifacts": updated_artifacts,
         "execution_trace": trace,
         "current_phase": "testing",
     }
+
+
+# Tell pytest not to discover tester_node as a test function
+tester_node.__test__ = False  # type: ignore[attr-defined]

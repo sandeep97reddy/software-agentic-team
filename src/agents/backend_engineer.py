@@ -40,11 +40,16 @@ Output the COMPLETE file content. Do not use placeholders like '# implementation
 
 @retry_middleware(max_retries=3)
 def backend_engineer_node(state: ProjectState) -> dict[str, Any]:
-    task_queue = list(state.get("task_queue", []))
-    if not task_queue:
+    task_queue = state.get("task_queue", [])
+    pending_tasks = [
+        t
+        for t in task_queue
+        if t.get("status", "pending") not in ("completed", "failed", "cancelled")
+    ]
+    if not pending_tasks:
         return {}
 
-    task = task_queue[0]
+    task = pending_tasks[0]
     workspace_dir = state.get("workspace_dir", "")
     trace: list[dict[str, Any]] = []
 
@@ -53,7 +58,7 @@ def backend_engineer_node(state: ProjectState) -> dict[str, Any]:
 
     file_path = task.get("file_path", "")
 
-    # Stagnation Check: Read current file content hash if it exists
+    # Stagnation Check: Read current file content if it exists
     current_content = ""
     try:
         current_content = fs.read_file(file_path)
@@ -93,27 +98,26 @@ Please provide the complete implementation for {file_path}.
 
     if new_content.strip() == current_content.strip() and new_content.strip() != "":
         # Stagnation detected
-        task_metadata = task.get("metadata", {})
+        task_metadata = dict(task.get("metadata", {}))
         stagnant_iterations = task_metadata.get("stagnant_iterations", 0) + 1
         task_metadata["stagnant_iterations"] = stagnant_iterations
-        task["metadata"] = task_metadata
 
         logger.warning(
             f"[BACKEND] Code stagnated for {result.file_path} (Iteration {stagnant_iterations})"
         )
 
         if stagnant_iterations >= 2:
-            task["status"] = "failed"
             error_msg = f"Stagnation Check Failed: Code hasn't changed in 2 iterations for {result.file_path}"
             logger.error(f"[BACKEND] {error_msg}")
-            # Do NOT pop the task so it fails the pipeline, or pop it to continue?
-            # If we fail the task, maybe we pop it so the pipeline continues?
-            # Let's pop it but mark it failed, and add error to state.
-            failed_task = task_queue.pop(0)
+            failed_task = {
+                "task_id": task.get("task_id", ""),
+                "status": "failed",
+                "metadata": task_metadata,
+            }
             return {
                 "status": "failed",
-                "task_queue": task_queue,
-                "completed_tasks": [failed_task],
+                "task_queue": [failed_task],
+                "completed_tasks": [{**task, **failed_task}],
                 "error_log": [
                     {
                         "node_name": "backend_engineer",
@@ -126,27 +130,36 @@ Please provide the complete implementation for {file_path}.
                 "execution_trace": trace,
             }
 
-        # Put back in queue to try one more time
-        task_queue[0] = task
-        return {"task_queue": task_queue, "execution_trace": trace}
+        # Update metadata to track stagnation count
+        return {
+            "task_queue": [
+                {
+                    "task_id": task.get("task_id", ""),
+                    "metadata": task_metadata,
+                }
+            ],
+            "execution_trace": trace,
+        }
 
     # Success, commit changes
     git.stage_all()
     git.commit(f"feat(backend): {task.get('title')}")
 
-    completed_task = task_queue.pop(0)
-    completed_task["status"] = "completed"
+    completed_task = {
+        **task,
+        "status": "completed",
+    }
+    remaining_tasks = [t for t in task_queue if t.get("task_id") != task.get("task_id")]
 
     artifact = {
         "file_path": result.file_path,
         "language": "python",
         "content": result.content,
-        "version": 1,
     }
 
     logger.info(f"[BACKEND] Task completed: {task.get('title')}")
     return {
-        "task_queue": task_queue,
+        "task_queue": remaining_tasks,
         "completed_tasks": [completed_task],
         "code_artifacts": [artifact],
         "execution_trace": trace,

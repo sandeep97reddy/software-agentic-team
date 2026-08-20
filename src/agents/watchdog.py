@@ -2,8 +2,8 @@
 Watchdog Node
 =============
 
-A special LangGraph node that monitors retry_counts.
-If a task fails 3 times, it redirects the graph to a human_approval node.
+A special LangGraph node that monitors task_failures.
+If a task fails 3 times, route_after_watchdog redirects the graph to a human_approval node.
 """
 
 import logging
@@ -19,7 +19,7 @@ def watchdog_node(state: ProjectState) -> dict[str, Any]:
     Watchdog node: monitors for infinite loops.
     Provides a waypoint for routing and logging.
     """
-    logger.info("[WATCHDOG] Checking task retry counts to prevent infinite loops...")
+    logger.info("[WATCHDOG] Checking task failure counts to prevent infinite loops...")
     return {}
 
 
