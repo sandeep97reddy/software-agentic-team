@@ -19,3 +19,4 @@ ENV/
 .idea/
 .vscode/
 .DS_Store
+.agents/
