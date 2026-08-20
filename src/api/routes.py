@@ -26,12 +26,12 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["projects"])
 
 # ──────────────────────────────────────────────────────────────
-#  In-memory run store  (swap for Redis / DB in production)
+#  In-memory run store  (fallback cache)
 # ──────────────────────────────────────────────────────────────
 _runs: dict[str, dict[str, Any]] = {}
 
 # ──────────────────────────────────────────────────────────────
-#  Compile the graph once at module-load time
+#  Compile the graph once at module-load time with default checkpointer
 # ──────────────────────────────────────────────────────────────
 _compiled_graph = build_graph()
 
@@ -79,6 +79,7 @@ class RunResponse(BaseModel):
     execution_trace: list[dict[str, Any]] = []
     error_log: list[dict[str, Any]] = []
     retry_counts: dict[str, int] = {}
+    task_failures: dict[str, int] = {}
 
 
 class StatusResponse(BaseModel):
@@ -106,10 +107,6 @@ def run_project(body: RunRequest) -> RunResponse:
     """
     Execute the full LangGraph pipeline synchronously and return the
     final state.
-
-    In a production deployment this would be an async background task
-    (Celery / ARQ), but synchronous execution is fine for the foundation
-    phase and keeps debugging simple.
     """
     project_id = str(uuid.uuid4())
     logger.info("[RUN] Received run request -- project_id=%s", project_id)
@@ -134,6 +131,7 @@ def run_project(body: RunRequest) -> RunResponse:
         "active_branch": "main",
         "execution_trace": [],
         "retry_counts": {},
+        "task_failures": {},
         "error_log": [],
         "current_phase": "initializing",
         "iteration": 0,
@@ -142,8 +140,6 @@ def run_project(body: RunRequest) -> RunResponse:
     }
 
     try:
-        # Build LangSmith run config so this entire pipeline execution
-        # shows up as a single named trace in the LangSmith UI.
         run_config = get_run_config(
             project_id=project_id,
             node_name="pipeline",
@@ -154,7 +150,7 @@ def run_project(body: RunRequest) -> RunResponse:
         logger.exception("Pipeline invocation failed for %s", project_id)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    # Persist the result for later status queries
+    # Persist the result for in-memory fallback
     _runs[project_id] = final_state
 
     return RunResponse(
@@ -173,12 +169,33 @@ def run_project(body: RunRequest) -> RunResponse:
         execution_trace=final_state.get("execution_trace", []),
         error_log=final_state.get("error_log", []),
         retry_counts=final_state.get("retry_counts", {}),
+        task_failures=final_state.get("task_failures", {}),
     )
 
 
 @router.get("/projects/{project_id}/status", response_model=StatusResponse)
 def get_project_status(project_id: str) -> StatusResponse:
-    """Return a summary of a previously-executed run."""
+    """Return a summary of a previously-executed run from checkpointer or memory store."""
+    try:
+        snapshot = _compiled_graph.get_state({"configurable": {"thread_id": project_id}})
+        if snapshot and snapshot.values:
+            run = snapshot.values
+            return StatusResponse(
+                project_id=project_id,
+                status=run.get("status", "unknown"),
+                current_phase=run.get("current_phase", "unknown"),
+                summary={
+                    "architecture_decisions_count": len(run.get("architecture_decisions", [])),
+                    "completed_tasks_count": len(run.get("completed_tasks", [])),
+                    "code_artifacts_count": len(run.get("code_artifacts", [])),
+                    "errors_count": len(run.get("error_log", [])),
+                    "retry_counts": run.get("retry_counts", {}),
+                    "task_failures": run.get("task_failures", {}),
+                },
+            )
+    except Exception as exc:
+        logger.debug("Checkpointer snapshot query failed for %s: %s", project_id, exc)
+
     run = _runs.get(project_id)
     if run is None:
         raise HTTPException(status_code=404, detail=f"Run {project_id} not found")
@@ -193,6 +210,7 @@ def get_project_status(project_id: str) -> StatusResponse:
             "code_artifacts_count": len(run.get("code_artifacts", [])),
             "errors_count": len(run.get("error_log", [])),
             "retry_counts": run.get("retry_counts", {}),
+            "task_failures": run.get("task_failures", {}),
         },
     )
 

@@ -2,26 +2,16 @@
 graph.py -- LangGraph pipeline definition.
 
 This module wires together the StateGraph using ``ProjectState`` as its
-schema.  The pipeline is structured in two phases:
+schema.  The pipeline is structured in three phases:
 
-Phase 1 -- Planning (Chunk 2):
+Phase 1 -- Planning:
     INIT --> REQ_ANALYZER --> ARCHITECT --> TASK_PLANNER
 
-Phase 2 -- Execution (stubs for future chunks):
-    TASK_PLANNER --> DEVELOPER --> TESTER --> REVIEWER --> END
+Phase 2 -- Execution:
+    TASK_PLANNER --> WORKERS (backend_engineer / frontend_engineer)
 
-Pipeline diagram:
-
-    +------+    +----------+    +-----------+    +----------+
-    | INIT |--->| REQ      |--->| ARCHITECT |--->| TASK     |
-    +------+    | ANALYZER |    +-----------+    | PLANNER  |
-                +----------+                     +----+-----+
-                                                      |
-                +----------+    +--------+    +----------+
-                | REVIEWER |<---| TESTER |<---| DEVELOPER|
-                +----+-----+    +--------+    +----------+
-                     |
-                    END
+Phase 3 -- Validation & Review:
+    WORKERS --> MEMORY_COMPRESSION --> TESTER --> REVIEWER --> WATCHDOG / HUMAN_APPROVAL --> END
 
 Every node is wrapped with ``retry_middleware`` so failures are caught,
 logged, and retried transparently.
@@ -31,28 +21,36 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, StateGraph
 
 from src.agents.architect import architect_node
 from src.agents.backend_engineer import backend_engineer_node
 from src.agents.frontend_engineer import frontend_engineer_node
 from src.agents.memory import memory_compression_node
-# Agents
 from src.agents.requirement_analyzer import requirement_analyzer_node
 from src.agents.reviewer import reviewer_node
 from src.agents.task_planner import task_planner_node
 from src.agents.tester import tester_node
 from src.agents.watchdog import human_approval_node, watchdog_node
+from src.core.checkpointer import get_checkpointer
 from src.core.middleware import retry_middleware
 from src.core.state import ProjectState
 from src.tools.filesystem import FileSystemManager
 from src.tools.git_tracker import GitTracker
 
 logger = logging.getLogger(__name__)
+
+__all__ = [
+    "initialize_project",
+    "route_to_workers",
+    "route_after_tester",
+    "route_after_reviewer",
+    "route_after_watchdog",
+    "build_graph",
+]
 
 
 # ──────────────────────────────────────────────────────────────
@@ -72,6 +70,7 @@ def initialize_project(state: ProjectState) -> dict[str, Any]:
         - Create the workspace directory via FileSystemManager.
         - Initialise a git repo and checkout ``active_branch`` via GitTracker.
         - Seed ``execution_trace`` with the tool records from setup.
+        - Initialise empty ``task_failures`` and ``error_log``.
     """
     project_id = state.get("project_id") or str(uuid.uuid4())
     workspace_dir = state.get("workspace_dir", "")
@@ -123,6 +122,8 @@ def initialize_project(state: ProjectState) -> dict[str, Any]:
         "max_retries": state.get("max_retries", 3),
         "status": "running",
         "retry_counts": state.get("retry_counts", {}),
+        "task_failures": state.get("task_failures", {}),
+        "error_log": state.get("error_log", []),
         "execution_trace": trace,
     }
 
@@ -133,17 +134,20 @@ def initialize_project(state: ProjectState) -> dict[str, Any]:
 
 
 def route_to_workers(state: ProjectState) -> str:
-    """Route after planner or workers -- check if tasks remain."""
+    """Route after planner or workers -- check if pending tasks remain."""
     if state.get("status") == "failed":
         logger.warning("[HALT] Pipeline halted -- status is FAILED")
         return END
 
     task_queue = state.get("task_queue", [])
-    if not task_queue:
+    pending_tasks = [
+        t for t in task_queue if t.get("status", "pending") not in ("completed", "failed", "cancelled")
+    ]
+    if not pending_tasks:
         logger.info("[ROUTE] No tasks remaining -- moving to memory compression")
         return "memory_compression"
 
-    next_task = task_queue[0]
+    next_task = pending_tasks[0]
     fp = next_task.get("file_path", "").lower()
 
     frontend_exts = [".tsx", ".jsx", ".ts", ".js", ".css", ".html"]
@@ -162,7 +166,10 @@ def route_after_tester(state: ProjectState) -> str:
     if state.get("status") == "failed":
         return END
     task_queue = state.get("task_queue", [])
-    if task_queue:
+    pending_tasks = [
+        t for t in task_queue if t.get("status", "pending") not in ("completed", "failed", "cancelled")
+    ]
+    if pending_tasks:
         logger.info("[ROUTE] QA found failures. Sending to watchdog.")
         return "watchdog"
     else:
@@ -175,16 +182,27 @@ def route_after_reviewer(state: ProjectState) -> str:
     if state.get("status") == "failed":
         return END
     task_queue = state.get("task_queue", [])
-    if task_queue:
+    pending_tasks = [
+        t for t in task_queue if t.get("status", "pending") not in ("completed", "failed", "cancelled")
+    ]
+    if pending_tasks:
         logger.info("[ROUTE] Reviewer found issues. Sending to watchdog.")
         return "watchdog"
     return END
 
 
 def route_after_watchdog(state: ProjectState) -> str:
-    """Check if task retry counts exceed 3."""
+    """Check if task failure counts exceed 3."""
+    task_failures = state.get("task_failures", {})
+    for k, v in task_failures.items():
+        if v >= 3:
+            logger.warning(
+                f"[ROUTE] Watchdog caught infinite loop on task failure '{k}' (count={v}). Routing to human_approval."
+            )
+            return "human_approval"
+
+    # Backward compatibility fallback for retry_counts keys with 'task_fail_' prefix
     retry_counts = state.get("retry_counts", {})
-    # Check if any task failed >= 3 times
     for k, v in retry_counts.items():
         if k.startswith("task_fail_") and v >= 3:
             logger.warning(
@@ -201,9 +219,18 @@ def route_after_watchdog(state: ProjectState) -> str:
 # ──────────────────────────────────────────────────────────────
 
 
-def build_graph() -> StateGraph:
+def build_graph(
+    checkpointer: BaseCheckpointSaver | bool | None = None,
+) -> StateGraph:
     """
     Construct and compile the full LangGraph ``StateGraph``.
+
+    Parameters
+    ----------
+    checkpointer : BaseCheckpointSaver | bool | None
+        - `BaseCheckpointSaver`: use provided checkpointer instance.
+        - `None` (default) or `True`: auto-resolve using `get_checkpointer()`.
+        - `False`: disable checkpointer (stateless compilation).
 
     Returns
     -------
@@ -223,7 +250,7 @@ def build_graph() -> StateGraph:
     graph.add_node("backend_engineer", backend_engineer_node)
     graph.add_node("frontend_engineer", frontend_engineer_node)
 
-    # Phase 3: QA & Review (Chunk 5)
+    # Phase 3: QA & Review
     graph.add_node("memory_compression", memory_compression_node)
     graph.add_node("tester", tester_node)
     graph.add_node("reviewer", reviewer_node)
@@ -249,6 +276,27 @@ def build_graph() -> StateGraph:
     graph.add_conditional_edges("watchdog", route_after_watchdog)
     graph.add_edge("human_approval", END)
 
-    compiled = graph.compile()
-    logger.info("[OK] LangGraph pipeline compiled successfully")
+    # ── Checkpointer Resolution ───────────────────────────────
+    saver: BaseCheckpointSaver | None
+    if checkpointer is False:
+        saver = None
+        logger.info("[GRAPH] Compiling graph in stateless mode (checkpointer=None)")
+    elif isinstance(checkpointer, BaseCheckpointSaver):
+        saver = checkpointer
+        logger.info(
+            "[GRAPH] Compiling graph with custom checkpointer: %s",
+            type(saver).__name__,
+        )
+    else:
+        saver = get_checkpointer()
+        logger.info(
+            "[GRAPH] Compiling graph with default checkpointer: %s",
+            type(saver).__name__,
+        )
+
+    compiled = graph.compile(checkpointer=saver)
+    logger.info(
+        "[OK] LangGraph pipeline compiled successfully (checkpointer=%s)",
+        type(saver).__name__ if saver else "None",
+    )
     return compiled

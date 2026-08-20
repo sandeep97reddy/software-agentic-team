@@ -86,6 +86,7 @@ app.add_middleware(
 
 # ── Mount route handlers ─────────────────────────────────────
 app.include_router(project_router, prefix="/api/v1")
+app.include_router(project_router)  # also mount at root for /health, /status, /execute
 
 
 # ── Root redirect to docs ────────────────────────────────────
