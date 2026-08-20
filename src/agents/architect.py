@@ -51,11 +51,11 @@ class EndpointSchema(BaseModel):
     )
     path: str = Field(..., description="URL path, e.g. '/api/v1/todos'")
     summary: str = Field(..., description="One-line description")
-    request_body: str = Field(
+    request_body: str | None = Field(
         default="",
         description="JSON schema or description of the request body",
     )
-    response_body: str = Field(
+    response_body: str | None = Field(
         default="",
         description="JSON schema or description of the response body",
     )
@@ -81,7 +81,7 @@ class ArchitectureBlueprint(BaseModel):
     The complete structured output from the Architect Agent.
     """
 
-    project_structure: list[FileNode] = Field(
+    project_structure: list[FileNode] | dict[str, Any] = Field(
         ...,
         description="Complete folder/file tree for the project",
     )
@@ -224,30 +224,56 @@ def architect_node(state: ProjectState) -> dict[str, Any]:
     # Convert ADRs into the state's architecture_decisions format
     arch_decisions = []
     for adr in blueprint.adrs:
-        arch_decisions.append(
-            {
-                "decision_id": adr.decision_id,
-                "title": adr.title,
-                "context": adr.context,
-                "decision": adr.decision,
-                "alternatives_considered": adr.alternatives_considered,
-                "consequences": adr.consequences,
-                "status": adr.status,
-            }
-        )
+        if hasattr(adr, "model_dump"):
+            arch_decisions.append(adr.model_dump())
+        elif isinstance(adr, dict):
+            arch_decisions.append(dict(adr))
+        else:
+            arch_decisions.append(
+                {
+                    "decision_id": getattr(adr, "decision_id", "ADR-001"),
+                    "title": getattr(adr, "title", "Decision"),
+                    "context": getattr(adr, "context", ""),
+                    "decision": getattr(adr, "decision", ""),
+                    "alternatives_considered": getattr(adr, "alternatives_considered", []),
+                    "consequences": getattr(adr, "consequences", ""),
+                    "status": getattr(adr, "status", "accepted"),
+                }
+            )
 
     # Build the project_structure payload
+    if isinstance(blueprint.project_structure, dict):
+        files = [
+            {"path": path, "type": "file", "purpose": purpose if isinstance(purpose, str) else ""}
+            for path, purpose in blueprint.project_structure.items()
+        ]
+    elif isinstance(blueprint.project_structure, list):
+        files = [
+            f.model_dump() if hasattr(f, "model_dump") else (f if isinstance(f, dict) else {"path": str(f)})
+            for f in blueprint.project_structure
+        ]
+    else:
+        files = []
+
+    file_map = {f["path"]: f.get("purpose", "") for f in files if isinstance(f, dict) and "path" in f}
     project_structure = {
-        "files": [f.model_dump() for f in blueprint.project_structure],
-        "api_endpoints": [e.model_dump() for e in blueprint.api_endpoints],
-        "database_tables": [t.model_dump() for t in blueprint.database_tables],
+        **file_map,
+        "files": files,
+        "api_endpoints": [
+            e.model_dump() if hasattr(e, "model_dump") else (e if isinstance(e, dict) else {"path": str(e)})
+            for e in blueprint.api_endpoints
+        ],
+        "database_tables": [
+            t.model_dump() if hasattr(t, "model_dump") else (t if isinstance(t, dict) else {"name": str(t)})
+            for t in blueprint.database_tables
+        ],
         "design_patterns": blueprint.design_patterns,
         "architecture_style": blueprint.architecture_style,
     }
 
     logger.info(
         "[ARCH] Blueprint complete: %d files, %d endpoints, %d tables, %d ADRs",
-        len(blueprint.project_structure),
+        len(files),
         len(blueprint.api_endpoints),
         len(blueprint.database_tables),
         len(blueprint.adrs),

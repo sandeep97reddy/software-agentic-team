@@ -38,9 +38,9 @@ class FunctionalRequirement(BaseModel):
     id: str = Field(..., description="e.g. FR-001")
     title: str = Field(..., description="Short title")
     description: str = Field(..., description="Detailed description")
-    priority: str = Field(
+    priority: str | int = Field(
         default="medium",
-        description="critical | high | medium | low",
+        description="critical | high | medium | low or numeric priority",
     )
     acceptance_criteria: list[str] = Field(
         default_factory=list,
