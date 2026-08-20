@@ -208,7 +208,23 @@ class SubprocessExecutor:
             self._allowlist = frozenset(allowed_commands)
 
         # Build subprocess environment
-        self._env: dict[str, str] = {**os.environ}
+        base_pythonpath = os.environ.get("PYTHONPATH", "")
+        workspace_paths = f"{self._root}{os.pathsep}{self._root / 'src'}"
+        pythonpath = f"{workspace_paths}{os.pathsep}{base_pythonpath}" if base_pythonpath else workspace_paths
+
+        sensitive_patterns = ("KEY", "SECRET", "PASS", "TOKEN", "CREDENTIAL", "AUTH_HEADER")
+        base_env = {
+            k: v
+            for k, v in os.environ.items()
+            if not any(pat in k.upper() for pat in sensitive_patterns)
+        }
+
+        self._env: dict[str, str] = {
+            **base_env,
+            "PYTHONIOENCODING": "utf-8",
+            "PYTHONUTF8": "1",
+            "PYTHONPATH": pythonpath,
+        }
         if env_overrides:
             self._env.update(env_overrides)
         # Ensure the venv's Scripts/bin is on PATH for pytest, ruff, etc.
@@ -230,12 +246,17 @@ class SubprocessExecutor:
         """Raise ValueError if the command is blocked by the allowlist."""
         if not command:
             raise ValueError("command must be a non-empty list")
-        executable = Path(command[0]).name  # strip directory prefix if any
-        if self._allowlist is not None and executable not in self._allowlist:
-            raise ValueError(
-                f"Command '{executable}' is not in the allowed-commands list. "
-                f"Allowed: {sorted(self._allowlist)}"
-            )
+        raw_name = Path(command[0]).name
+        executable = raw_name.lower()
+        base_name = executable[:-4] if executable.endswith(".exe") else executable
+
+        if self._allowlist is not None:
+            allowed_lower = {cmd.lower() for cmd in self._allowlist}
+            if executable not in allowed_lower and base_name not in allowed_lower:
+                raise ValueError(
+                    f"Command '{raw_name}' is not in the allowed-commands list. "
+                    f"Allowed: {sorted(self._allowlist)}"
+                )
 
     def _truncate(self, text: str) -> str:
         """Truncate and clean text to ``max_output_bytes``."""
