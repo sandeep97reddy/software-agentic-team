@@ -1,46 +1,48 @@
 """
 ProjectState — the single Source of Truth for the entire LangGraph pipeline.
 
-Every node in the graph reads from and writes to this TypedDict.  LangGraph
-uses the Annotated[..., operator.add] pattern to *merge* list values returned
-by different nodes rather than overwriting them.
-
-Design decisions
-────────────────
-• TypedDict (not a dataclass/BaseModel) because LangGraph's StateGraph
-  expects a TypedDict schema; Pydantic validation lives at the API boundary
-  instead (see `src/api/schemas.py` in later chunks).
-• All mutable collections use `operator.add` so parallel branches can safely
-  append without conflicts.
-• `retry_counts` maps  node_name → cumulative failure count  and is used by
-  the retry middleware to decide whether to re-invoke or abort.
-• `error_log` gives full observability into what went wrong and when.
+Every node in the graph reads from and writes to this TypedDict. Custom
+reducers ensure deterministic state transitions, idempotence, deduplication,
+and safe dictionary merges without unexpected key clobbering.
 """
 
 from __future__ import annotations
 
-import operator
 from datetime import datetime, timezone
 from typing import Annotated, Any, TypedDict
 
 from pydantic import BaseModel, Field
 
+from src.core.reducers import (
+    CLEAR,
+    ClearSignal,
+    adr_reducer,
+    artifact_reducer,
+    clearable_list_reducer,
+    dict_merge_reducer,
+    task_queue_reducer,
+)
 
-def clearable_list_reducer(existing: list | None, new: list | str) -> list:
-    """Reducer that appends lists, but clears them if the string 'CLEAR' is passed."""
-    if existing is None:
-        existing = []
-    if new == "CLEAR":
-        return []
-    if isinstance(new, list):
-        if new and new[0] == "CLEAR":
-            return new[1:]
-        return existing + new
-    return existing + [new]
+__all__ = [
+    "ClearSignal",
+    "CLEAR",
+    "clearable_list_reducer",
+    "artifact_reducer",
+    "task_queue_reducer",
+    "dict_merge_reducer",
+    "adr_reducer",
+    "TaskItem",
+    "CodeArtifact",
+    "ArchitectureDecision",
+    "ADR",
+    "ErrorRecord",
+    "ExecutionTraceItem",
+    "ProjectState",
+]
 
 
 # ─────────────────────────────────────────────────────────────
-#  Sub-models  (Pydantic)  — structured data inside the state
+#  Sub-models (Pydantic) — structured data at boundaries
 # ─────────────────────────────────────────────────────────────
 
 
@@ -50,9 +52,14 @@ class TaskItem(BaseModel):
     task_id: str = Field(..., description="Unique identifier, e.g. 'TASK-001'")
     title: str = Field(..., description="Short human-readable title")
     description: str = Field(default="", description="Detailed specification")
+    file_path: str = Field(default="", description="Target file path for implementation")
+    task_type: str = Field(
+        default="implementation",
+        description="implementation | configuration | test | documentation | integration",
+    )
     assigned_to: str = Field(
         default="unassigned",
-        description="Agent role responsible: architect | developer | tester | reviewer",
+        description="Agent role responsible: architect | backend_engineer | frontend_engineer | tester | reviewer",
     )
     priority: int = Field(
         default=2,
@@ -68,11 +75,19 @@ class TaskItem(BaseModel):
         default_factory=list,
         description="List of task_ids that must finish first",
     )
+    acceptance_criteria: list[str] = Field(
+        default_factory=list,
+        description="Verification criteria for this task",
+    )
+    related_requirements: list[str] = Field(
+        default_factory=list,
+        description="Requirement IDs addressed by this task",
+    )
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class CodeArtifact(BaseModel):
-    """A file produced (or modified) by the developer agent."""
+    """A file produced (or modified) by a developer agent."""
 
     file_path: str = Field(..., description="Relative path inside the output project")
     language: str = Field(default="python")
@@ -94,10 +109,18 @@ class ArchitectureDecision(BaseModel):
     title: str
     context: str = Field(default="", description="Why this decision was needed")
     decision: str = Field(default="", description="What was decided")
+    alternatives_considered: list[str] = Field(
+        default_factory=list,
+        description="Alternatives evaluated",
+    )
     consequences: str = Field(default="", description="Trade-offs and implications")
     status: str = Field(
         default="proposed", description="proposed | accepted | superseded"
     )
+
+
+# Alias for backward compatibility
+ADR = ArchitectureDecision
 
 
 class ErrorRecord(BaseModel):
@@ -106,6 +129,7 @@ class ErrorRecord(BaseModel):
     node_name: str
     error_type: str
     error_message: str
+    traceback: str = Field(default="")
     timestamp: str = Field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat(),
     )
@@ -113,8 +137,22 @@ class ErrorRecord(BaseModel):
     resolved: bool = Field(default=False)
 
 
+class ExecutionTraceItem(BaseModel):
+    """Structured record of a tool execution event in the sandbox."""
+
+    tool: str = Field(..., description="Tool name (e.g. filesystem, git, executor)")
+    operation: str = Field(..., description="Operation performed (e.g. write_file, commit)")
+    inputs: dict[str, Any] = Field(default_factory=dict)
+    outputs: Any = Field(default=None)
+    success: bool = Field(default=True)
+    duration_ms: float = Field(default=0.0)
+    timestamp: str = Field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat(),
+    )
+
+
 # ─────────────────────────────────────────────────────────────
-#  ProjectState  —  LangGraph graph state (TypedDict)
+#  ProjectState — LangGraph graph state (TypedDict)
 # ─────────────────────────────────────────────────────────────
 
 
@@ -122,43 +160,46 @@ class ProjectState(TypedDict, total=False):
     """
     Central state that flows through every node of the LangGraph pipeline.
 
-    Fields using ``Annotated[list[…], operator.add]`` are *append-merged*:
-    a node can return ``{"task_queue": [new_task]}`` and LangGraph will
-    concatenate it with the existing list rather than replacing it.
+    All state mutation occurs through typed reducers:
+    - architecture_decisions: Deduplicated by decision_id via adr_reducer.
+    - task_queue: Upserted by task_id via task_queue_reducer.
+    - completed_tasks: Clearable list via clearable_list_reducer.
+    - code_artifacts: Deduplicated by file_path with auto-versioning via artifact_reducer.
+    - execution_trace: Clearable list via clearable_list_reducer.
+    - retry_counts: Merged by node_name via dict_merge_reducer.
+    - task_failures: Merged by file_path/task_id via dict_merge_reducer.
+    - error_log: Clearable list via clearable_list_reducer.
     """
 
-    # ── identity ──────────────────────────────────────────────
+    # ── Identity & Configuration ──
     project_id: str
     project_name: str
+    requirements: str
+    workspace_dir: str
+    active_branch: str
 
-    # ── inputs ────────────────────────────────────────────────
-    requirements: str  # raw user requirements (natural language)
+    # ── Planning Artefacts ──
+    technical_specifications: dict[str, Any]
+    project_structure: dict[str, Any]
+    architecture_decisions: Annotated[list[dict[str, Any]], adr_reducer]
 
-    # ── planning artefacts ────────────────────────────────────
-    architecture_decisions: Annotated[list[dict[str, Any]], operator.add]
-    technical_specifications: dict[str, Any]  # output of Requirement Analyzer
-    project_structure: dict[str, Any]  # output of Architect (folder tree + API schema)
-
-    # ── work items ────────────────────────────────────────────
-    task_queue: list[dict[str, Any]]
+    # ── Task Management ──
+    task_queue: Annotated[list[dict[str, Any]], task_queue_reducer]
     completed_tasks: Annotated[list[dict[str, Any]], clearable_list_reducer]
 
-    # ── code output ───────────────────────────────────────────
-    code_artifacts: Annotated[list[dict[str, Any]], operator.add]
+    # ── Code Output & Artifacts ──
+    code_artifacts: Annotated[list[dict[str, Any]], artifact_reducer]
 
-    # ── execution sandbox (Chunk 3) ───────────────────────────
-    workspace_dir: str  # absolute path to the sandboxed output workspace
-    active_branch: str  # git branch currently checked out in workspace
-    execution_trace: Annotated[
-        list[dict[str, Any]], clearable_list_reducer
-    ]  # audit log of every tool call
+    # ── Execution Sandbox & Trace ──
+    execution_trace: Annotated[list[dict[str, Any]], clearable_list_reducer]
 
-    # ── reliability / observability ───────────────────────────
-    retry_counts: dict[str, int]  # node_name → failure count
-    error_log: Annotated[list[dict[str, Any]], operator.add]
+    # ── Observability & Reliability ──
+    retry_counts: Annotated[dict[str, int], dict_merge_reducer]
+    task_failures: Annotated[dict[str, int], dict_merge_reducer]
+    error_log: Annotated[list[dict[str, Any]], clearable_list_reducer]
 
-    # ── control flow ──────────────────────────────────────────
-    current_phase: str  # planning | development | testing | review
-    iteration: int  # global loop counter
-    max_retries: int  # per-node retry ceiling (default set in graph)
-    status: str  # initialized | running | completed | failed
+    # ── Lifecycle & Control Flow ──
+    current_phase: str
+    iteration: int
+    max_retries: int
+    status: str
