@@ -29,6 +29,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+__all__ = ["setup_langsmith", "get_langsmith_metadata", "get_run_config"]
+
 
 def setup_langsmith() -> bool:
     """
@@ -103,19 +105,30 @@ def get_langsmith_metadata(project_id: str, node_name: str, **extra: Any) -> dic
     }
 
 
-def get_run_config(project_id: str, node_name: str, **extra: Any) -> dict[str, Any]:
+def get_run_config(
+    project_id: str,
+    node_name: str = "pipeline",
+    thread_id: str | None = None,
+    **extra: Any,
+) -> dict[str, Any]:
     """
     Return a ``config`` dict suitable for passing to LangChain / LangGraph
-    ``.invoke()`` / ``.stream()`` so that the run is tagged correctly in the
-    LangSmith UI.
+    ``.invoke()`` / ``.stream()`` with thread_id configured for checkpointer persistence
+    and run metadata tagged correctly in the LangSmith UI.
 
     Usage
     -----
     >>> config = get_run_config(project_id, "backend_engineer")
     >>> llm.invoke(messages, config=config)
     """
+    resolved_thread_id = thread_id or project_id
     return {
+        "configurable": {"thread_id": resolved_thread_id},
         "metadata": get_langsmith_metadata(project_id, node_name, **extra),
-        "tags": [f"node:{node_name}", f"project:{project_id[:8]}"],
+        "tags": [
+            f"node:{node_name}",
+            f"project:{project_id[:8]}",
+            f"thread:{resolved_thread_id[:8]}",
+        ],
         "run_name": f"{node_name} [{project_id[:8]}]",
     }
