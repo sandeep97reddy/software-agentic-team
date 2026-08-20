@@ -108,9 +108,19 @@ class FileSystemManager:
         PermissionError
             If the resolved path escapes the workspace root.
         """
-        # Strip leading slashes / backslashes to force relative resolution
-        cleaned = relative_path.lstrip("/\\")
-        resolved = (self._root / cleaned).resolve()
+        p = Path(relative_path)
+        if p.is_absolute() or relative_path.startswith(("/", "\\")):
+            try:
+                resolved = p.resolve()
+                resolved.relative_to(self._root)
+                return resolved
+            except ValueError:
+                raise PermissionError(
+                    f"Path traversal denied: '{relative_path}' resolves outside "
+                    f"workspace root '{self._root}'"
+                )
+
+        resolved = (self._root / relative_path).resolve()
 
         # Strict containment check
         try:
