@@ -1,56 +1,90 @@
-# Contributing Guidelines
+# 🛠 Contributing Guidelines & Engineering Standards
 
-Thank you for your interest in contributing to our autonomous AI software engineering team! This project aims to define the enterprise standard for LangGraph orchestration and multi-agent coordination.
+Thank you for contributing to the **Autonomous AI Software Engineering Team**! This project sets the enterprise benchmark for LangGraph-driven multi-agent systems, ReAct code navigation, and deterministic software verification.
 
-To maintain the deterministic reliability of our orchestration pipeline, we enforce strict guidelines when contributing to the `ProjectState`, Agent Nodes, or the Tool/Skill layers.
+To maintain the rock-solid reliability, thread safety, and immutability of our orchestration pipeline, we enforce strict architectural standards for state schemas, agent nodes, tools, and test suites.
 
-## 1. Expanding the Core State Schema
+---
 
-The global state (`src/core/state.py`) is the lifeblood of the LangGraph pipeline.
+## 🏛 1. Core State Schema & Reducer Contracts
 
-- **Use TypedDict:** Any new top-level key must be defined in the `ProjectState` `TypedDict`. LangGraph utilizes this dict representation to manage node-to-node routing states.
-- **Annotated Reducers for Collections:** If your new key represents a collection (like a list of items), you **must** use `Annotated[..., operator.add]` or a custom reducer.
-  - *Why?* If parallel branches execute, failing to use a reducer will cause one branch to entirely overwrite the progress of another.
-- **Pydantic Validation:** If the data structure is complex (e.g., an object rather than a primitive), define a `pydantic.BaseModel` for it. Do not rely on untyped dictionaries inside arrays.
+The global state in [`src/core/state.py`](src/core/state.py) is the single source of truth for the entire multi-agent graph.
 
-## 2. Scaling Out New Nodes (Agents)
+### Strict Reducer Rule for State Collections
+Never use raw lists for state fields that can be updated concurrently or across iterations. You **must** annotate collections with custom reducers defined in [`src/core/reducers.py`](src/core/reducers.py):
 
-If you are adding a new agent (e.g., a `database_architect` or a `devops_engineer`), follow the architectural standard:
+| State Key | Required Reducer | Rationale |
+| :--- | :--- | :--- |
+| `code_artifacts` | `artifact_reducer` | Canonicalizes file paths, prevents duplicate entries, and manages atomic version bumps upon content change. |
+| `task_queue` | `task_queue_reducer` | Performs atomic task upserts by `task_id` while preserving execution order. |
+| `completed_tasks` | `clearable_list_reducer` | Appends completed tasks while supporting atomic context resets via `ClearSignal` or `"CLEAR"`. |
+| `execution_trace` | `clearable_list_reducer` | Accumulates telemetry and enables memory compression truncation. |
+| `architecture_decisions` | `adr_reducer` | Deduplicates and updates ADRs by `decision_id`. |
+| `retry_counts` | `dict_merge_reducer` | Merges retry counters without overwriting failure tracking keys. |
 
-### Step 1: Define the Node Interface
-All nodes must be pure functions with a strict signature:
+### Pydantic Sub-Model Typing
+All complex payloads (e.g., `TaskItem`, `CodeArtifact`, `ADR`, `ErrorRecord`) must have a corresponding Pydantic v2 `BaseModel`. Untyped or generic dictionaries are strictly forbidden inside graph state lists.
+
+---
+
+## 🤖 2. Agent Node Design (Stateless Pure Functions)
+
+Every LangGraph node represents an isolated agent worker and must adhere to pure functional semantics:
+
+### Node Signature
 ```python
-def my_new_node(state: ProjectState) -> dict[str, Any]:
-    pass
+def my_agent_node(state: ProjectState) -> dict[str, Any]:
+    """
+    Pure function: receives frozen ProjectState, performs bounded
+    LLM invocation or side-effect, and returns state mutation dict.
+    """
+    ...
 ```
 
-### Step 2: Implement the `@retry_middleware`
-You **must** decorate your node with `@retry_middleware()`. Do not write custom `try/except` loops to catch API timeouts or LLM hallucinations. Let the middleware handle it uniformly so the global `error_log` and `retry_counts` update deterministically.
+### Mandatory `@retry_middleware` Wrapper
+All agent nodes must be decorated with `@retry_middleware(max_retries=3)`.
+- Do not write manual `try/except` loops inside node functions.
+- The middleware automatically captures exceptions, records structured `ErrorRecord` objects in `error_log`, tracks attempts in `retry_counts`, and manages exponential backoff.
 
-### Step 3: Wire into the Graph
-Open `src/core/graph.py` and register your node inside `build_graph()`:
-```python
-graph.add_node("my_new_node", my_new_node)
+---
+
+## 🔧 3. Tool Sandboxing & Execution Security
+
+Tools in [`src/tools/`](src/tools/) perform sandboxed execution and must observe the following constraints:
+
+1. **Workspace Jail & Path Containment**:
+   All filesystem reads and writes must pass through `FileSystemManager._safe_resolve()`. Any path attempting to escape the workspace root (`../../`, `/etc/passwd`, `C:\Windows`) must immediately raise a `PermissionError`.
+2. **Credential Sanitization**:
+   Subprocess executors must never leak host secrets. Any environment variable containing `KEY`, `SECRET`, `PASS`, `TOKEN`, or `CREDENTIAL` must be filtered from child processes unless explicitly supplied.
+3. **Structured Telemetry Ingestion**:
+   All tools must accept the `trace: list[dict[str, Any]]` array by reference and append structured records (operation, duration, input, sha256 output, exit code).
+
+---
+
+## 🧪 4. 4-Tier Testing Requirement
+
+Every pull request must maintain **100% test pass rate** across all 4 verification tiers:
+
+- **Unit Tests (`tests/unit/`)**: Verify custom reducers, signal handling, and checkpointer persistence backends in complete isolation.
+- **Tier 1 Feature Tests (`tests/e2e/test_tier1_features.py`)**: Individual feature assertions across F1–F25.
+- **Tier 2 Boundary Tests (`tests/e2e/test_tier2_boundaries.py`)**: Edge cases, schema bounds, syntax errors, and fault injection.
+- **Tier 3 Combination Tests (`tests/e2e/test_tier3_combinations.py`)**: Cross-feature and multi-agent interaction combinations.
+- **Tier 4 Workloads (`tests/e2e/test_tier4_workloads.py`)**: Sustained SWE-bench bug-fix scenarios, server reboot state recovery, and HITL flows.
+
+### Running Test Verification
+```bash
+# Execute entire test suite (325 tests)
+python -m pytest tests/unit/ tests/e2e/ -v
 ```
-Update the relevant routing edge logic (e.g., modifying `route_to_workers`) to dynamically direct tasks to your new node when appropriate.
 
-## 3. Adding New Skills (Tools)
+---
 
-Tools are defined in `src/tools/` and are strictly distinct from Agents. They are deterministic Python modules that interact with the host system.
+## 📋 5. Pull Request Review Checklist
 
-- **Class-Based Encapsulation:** New capabilities (e.g., `DockerManager` or `AWSCliWrapper`) must be built as Python classes.
-- **Trace Injection Requirement:** The `__init__` method of your new tool must accept the global `execution_trace` array by reference:
-  ```python
-  def __init__(self, trace: list[dict]):
-      self.trace = trace
-  ```
-- **Strict Logging:** Every action the tool takes (e.g., spinning up a container, downloading an artifact) must append a structured event log to `self.trace`. This guarantees complete auditability of side effects.
-- **Sandbox Isolation:** Ensure any file paths or executable inputs are strictly confined within the `workspace_dir` context passed from the `Initializer` node.
-
-## 4. Pull Request Process
-
-1. Create a descriptive feature branch (e.g., `feat/add-database-node`).
-2. Implement your logic conforming to the `CODE_STANDARDS.md`.
-3. Add or update tests in the `tests/` directory. If testing a new tool, append it to the `test_tools_integration.py` script.
-4. Execute the pipeline locally using the `RUNBOOK.md` instructions and ensure the graph compiles and traces perfectly in LangSmith.
-5. Submit your PR and request a review from a core maintainer.
+Before opening a PR, ensure that:
+- [ ] All new state fields use appropriate custom reducers from `src/core/reducers.py`.
+- [ ] Agent nodes are pure functions decorated with `@retry_middleware`.
+- [ ] Pydantic models for structured LLM outputs have `__test__ = False` if class names start with `Test`.
+- [ ] Subprocess executions resolve workspace paths safely and sanitize host secrets.
+- [ ] Full test suite passes: `python -m pytest tests/unit/ tests/e2e/ -v` (325/325 tests).
+- [ ] Code is formatted with `black` / `ruff` and strictly typed without linting warnings.

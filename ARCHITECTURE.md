@@ -1,75 +1,124 @@
-# Architecture & State Management
+# 🏛 Architecture & State Management
 
-This document details the core architectural decisions, state management patterns, and edge routing logic powering our autonomous AI software engineering team.
+This document details the architectural decisions, state management patterns, and edge routing logic powering our autonomous AI software engineering team.
 
-## 🧠 LangGraph State Machine
+---
 
-The system is designed as a deterministic **StateGraph** using LangGraph. The pipeline is fundamentally a state machine that transitions through well-defined phases: `planning`, `execution`, and `validation`. 
+## 🧠 LangGraph State Machine Architecture
 
-Each node in the graph represents an isolated worker (or agent) that reads from a single, globally immutable-by-convention state, performs its task, and returns a dictionary of state updates.
+The system is engineered as a deterministic **StateGraph** using LangGraph. The pipeline is fundamentally a finite state machine that transitions through discrete phases: `planning`, `development`, `testing`, `review`, and `completed` (or `blocked`).
 
-### Phase 1: Planning
-The pipeline always begins linearly to prevent execution before design is finalized.
-`Initializer` → `Requirement Analyzer` → `Architect` → `Task Planner`
+Each node in the graph represents an isolated worker (or agent) that reads from a frozen snapshot of `ProjectState`, performs its deterministic LLM invocation or sandboxed side-effect, and returns an atomic state mutation dictionary.
 
-### Phase 2: Execution & Routing Loop
-The execution phase uses conditional edges to dynamically route tasks to specialized engineers.
-The `Task Planner` populates a queue of tasks. A router node evaluates `state["task_queue"]`. If tasks exist, it looks at the target file extensions:
-- Exts like `.tsx`, `.js`, `.css` → routes to **Frontend Engineer**
-- Other extensions/paths → routes to **Backend Engineer**
+```mermaid
+graph TD
+    INIT[Initializer] --> REQ[Requirement Analyzer]
+    REQ --> ARCH[Architect Agent]
+    ARCH --> TASK[Task Planner]
+    
+    TASK --> ROUTER{Worker Router}
+    ROUTER --> |Frontend Task| FRONTEND[Frontend Engineer]
+    ROUTER --> |Backend Task| BACKEND[Backend Engineer]
+    
+    FRONTEND --> ROUTER
+    BACKEND --> ROUTER
+    
+    ROUTER --> |All Tasks Drained| MEM[Memory Compression]
+    MEM --> QA[QA Tester]
+    
+    QA --> |Tests Passed| REV[Code Reviewer]
+    QA --> |Tests Failed| WATCHDOG{Watchdog Loop Guard}
+    
+    REV --> |Security Approved| END_NODE(((END / Completed)))
+    REV --> |Security Issues| WATCHDOG
+    
+    WATCHDOG --> |Failure Count < 3| ROUTER
+    WATCHDOG --> |Failure Count >= 3| HUMAN[Human Approval Halt State]
+    HUMAN --> END_NODE
+```
 
-This loop continues until the task queue is empty.
+---
 
-### Phase 3: Validation & Memory
-Once the queue is drained:
-`Memory Compression` → `QA Tester`
+## 💾 State Management & Reducer Registry
 
-The `QA Tester` runs deterministic static analysis and tests via the Subprocess Executor. 
-- **Pass:** Routes to the **Reviewer**.
-- **Fail:** Re-queues the failed task and routes to the **Watchdog**.
+Our state is strictly typed using Python's `TypedDict` and augmented with custom mathematical reducers to enable conflict-free parallel branching, artifact deduplication, and atomic history truncations.
 
-## 💾 State Management (ProjectState)
-
-Our state is strictly typed using Python's `TypedDict` and augmented with `operator.add` reducers to enable safe parallel branching and append-only state mutations.
-
-The single source of truth is the `ProjectState` (defined in `src/core/state.py`):
+The single source of truth is `ProjectState` (defined in [`src/core/state.py`](src/core/state.py)):
 
 ```python
 class ProjectState(TypedDict, total=False):
     project_id: str
+    workspace_dir: str
     requirements: str
-    architecture_decisions: Annotated[list[dict[str, Any]], operator.add]
-    task_queue: list[dict[str, Any]]
+    technical_specifications: dict[str, Any]
+    architecture_decisions: Annotated[list[dict[str, Any]], adr_reducer]
+    project_structure: dict[str, Any]
+    task_queue: Annotated[list[dict[str, Any]], task_queue_reducer]
     completed_tasks: Annotated[list[dict[str, Any]], clearable_list_reducer]
-    code_artifacts: Annotated[list[dict[str, Any]], operator.add]
+    code_artifacts: Annotated[list[dict[str, Any]], artifact_reducer]
     execution_trace: Annotated[list[dict[str, Any]], clearable_list_reducer]
-    retry_counts: dict[str, int]
+    error_log: Annotated[list[dict[str, Any]], operator.add]
+    retry_counts: Annotated[dict[str, int], dict_merge_reducer]
+    task_failures: Annotated[dict[str, int], dict_merge_reducer]
+    max_retries: int
     current_phase: str
     status: str
 ```
 
-### Pydantic Sub-Models
-While the LangGraph global state must be a `TypedDict` to satisfy schema constraints, we enforce rigorous typing at the agent boundary using **Pydantic BaseModel**.
+### Specialized Reducers ([`src/core/reducers.py`](src/core/reducers.py))
 
-Key sub-models include:
-- `TaskItem`: Defines bounded execution criteria for engineers (`task_id`, `dependencies`, `assigned_to`).
-- `ArchitectureDecision`: An ADR (Architecture Decision Record) dictating the system design.
-- `CodeArtifact`: Represents generated code, its path, language, and validation status.
-- `ErrorRecord`: A structured log for tracking node failures and facilitating observability.
+1. **`artifact_reducer`**:
+   - Deduplicates artifacts by canonical normalized file path (`posixpath.normpath`).
+   - Automatically bumps `version` upon content modifications.
+   - Resets `tests_passed` to `None` when underlying source code is updated.
+2. **`task_queue_reducer`**:
+   - Performs atomic upserts by `task_id`.
+   - Preserves FIFO execution order and dependency relations.
+3. **`clearable_list_reducer`**:
+   - Standard append-only reducer for telemetry and trace logs.
+   - Clears the array when receiving `ClearSignal` or `"CLEAR"` sentinel without losing subsequent events.
+4. **`dict_merge_reducer`**:
+   - Conflict-free dictionary key-value updates for `retry_counts` and `task_failures`.
+5. **`adr_reducer`**:
+   - Deduplicates Architectural Decision Records by `decision_id`.
 
-### Reducer Functions
-To prevent destructive overrides during concurrent execution, we use custom reducers. For example, `clearable_list_reducer` appends lists naturally but allows nodes to pass `"CLEAR"` to reset the array. This is critical for the **Memory Compression** node to truncate logs dynamically while preserving long-term memory.
+---
 
-## 🔀 Conditional Edge Routing
+## 🔒 Checkpointing & Persistence Architecture
 
-LangGraph conditional edges (`add_conditional_edges`) dictate the flow dynamically based on state mutations.
+Located in [`src/core/checkpointer.py`](src/core/checkpointer.py), the checkpointer layer provides multi-backend persistence:
 
-1. **`route_to_workers`**: Evaluates the `task_queue`. If empty, returns `memory_compression`. If populated, analyzes the first task's file path to return either `frontend_engineer` or `backend_engineer`.
-2. **`route_after_tester`**: Checks the QA results. If tests fail, returns `watchdog`. If pass, returns `reviewer`.
-3. **`route_after_reviewer`**: Checks for security/style issues. If anomalies are found, returns `watchdog`, else returns `END`.
-4. **`route_after_watchdog`**: Checks `retry_counts`. If any task fails >= 3 times, routes to `human_approval`. Otherwise, routes back to `route_to_workers`.
+- **`MemorySaver`**: Fast, thread-isolated in-memory persistence for testing and local development.
+- **`PostgresSaver`**: Enterprise relational checkpointing with connection pooling and audit logging.
+- **`RedisSaver`**: Ultra-low-latency distributed checkpointing and pub/sub streaming.
+- **`get_checkpointer()` Factory**: Automatically detects environment variables (`CHECKPOINTER_BACKEND`, `DATABASE_URL`, `REDIS_URL`) and gracefully falls back to memory if external systems are unreachable.
 
-## 🛡 Retry Middleware
+---
 
-Instead of embedding try/catch loops in every agent, all LangGraph nodes are decorated with a `@retry_middleware`.
-This wrapper intercepts execution. If a node crashes, it logs the exception to the `error_log`, increments `retry_counts[node_name]`, and re-invokes the node up to `max_retries`. This separates business logic from fault-tolerance logic.
+## 🔀 Dynamic Edge Routing Functions
+
+Located in [`src/core/graph.py`](src/core/graph.py):
+
+1. **`route_to_workers`**:
+   - Evaluates `task_queue`.
+   - If tasks with `status != "completed"` exist, inspects the next task's file path (`.tsx`, `.jsx`, `.css`, `frontend/` $\rightarrow$ `frontend_engineer`; otherwise $\rightarrow$ `backend_engineer`).
+   - If all tasks are completed, routes to `memory_compression`.
+2. **`route_after_tester`**:
+   - Evaluates test outcomes. If fixing tasks were queued, routes to `watchdog`. If all tests passed, advances to `reviewer`.
+3. **`route_after_reviewer`**:
+   - Evaluates static code review findings. If issues were flagged, routes to `watchdog`. If approved, transitions to `END`.
+4. **`route_after_watchdog`**:
+   - Inspects `task_failures` and `retry_counts`.
+   - If any task has failed $\ge 3$ times, triggers an emergency halt to `human_approval`.
+   - Otherwise, routes back to `route_to_workers` for automated retry.
+
+---
+
+## 🛡 Fault Tolerance & Retry Middleware
+
+Instead of scattering ad-hoc `try/except` loops across agents, every node is decorated with `@retry_middleware(max_retries=3)` ([`src/core/middleware.py`](src/core/middleware.py)):
+- Intercepts uncaught exceptions and API timeouts.
+- Records structured `ErrorRecord` objects in `error_log`.
+- Tracks attempt counters in `retry_counts[node_name]`.
+- Implements deterministic exponential backoff ($1\text{s}, 2\text{s}, 4\text{s}$).
+- Upon exhausting retries, cleanly marks the graph status as `failed` without crashing the host process.
